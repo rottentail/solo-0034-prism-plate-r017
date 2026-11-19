@@ -298,6 +298,31 @@
       "verification": "python3 scripts/walkthrough.py --workflow isolation"
     },
     {
+      "id": "component",
+      "name": "跨版面组件引用",
+      "entry": "PUT /v1/plates/{id} 的 component 挂载 → 渲染 → 封包导入",
+      "module_ids": [
+        "transport",
+        "service",
+        "scene",
+        "validate",
+        "paint",
+        "raster",
+        "vector",
+        "bundle",
+        "repository"
+      ],
+      "steps": [
+        "从公开入口解析并获取固定来源",
+        "按内容摘要冻结被引用稿本闭包",
+        "展开挂载实例并计算成品",
+        "携带冻结闭包封包并在无同名来源的实例重现"
+      ],
+      "success": "来源改稿不影响已交付版面；镜像缩放保持局部裁域与渐变；离线重现同一摘要",
+      "failure": "缺失来源404、循环/过深/过大展开400且不写历史、封包篡改400",
+      "verification": "python3 scripts/walkthrough.py --workflow component"
+    },
+    {
       "id": "rejection",
       "name": "错误场景原子拒绝",
       "entry": "POST非法场景 → GET → 正常出图",

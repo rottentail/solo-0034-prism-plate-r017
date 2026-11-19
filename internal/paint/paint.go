@@ -64,3 +64,36 @@ func Over(dst, src Pixel, mode string) Pixel {
 	}
 	return Pixel{blend(dst.R, src.R), blend(dst.G, src.G), blend(dst.B, src.B), src.A + dst.A*(1-src.A)}
 }
+
+// Content returns one layer's source pixel at parent-space point p. Component
+// layers recurse through their frozen transform: the inverse mapping keeps
+// child clips, masks and gradient axes in the child's local coordinates, so a
+// mirrored or scaled instance preserves their local meaning.
+func Content(p geom.Point, l scene.CompiledLayer) Pixel {
+	if l.Component != nil {
+		return Layers(l.Component.Inverse.Apply(p), l.Component.Layers)
+	}
+	src := Pixel{}
+	for _, s := range l.Shapes {
+		q := s.Inverse.Apply(p)
+		if s.Path.Contains(q, s.Shape.FillRule) {
+			src = Over(src, Sample(s.Shape.Brush, q), "normal")
+		}
+	}
+	return src
+}
+
+// Layers composites a layer list onto transparency at p.
+func Layers(p geom.Point, layers []scene.CompiledLayer) Pixel {
+	dst := Pixel{}
+	for _, l := range layers {
+		if len(l.Clip) > 0 && !l.Clip.Contains(p, "nonzero") {
+			continue
+		}
+		if len(l.Mask) > 0 && !l.Mask.Contains(p, "nonzero") {
+			continue
+		}
+		dst = Over(dst, Content(p, l).Scale(l.Layer.Opacity), l.Layer.Blend)
+	}
+	return dst
+}

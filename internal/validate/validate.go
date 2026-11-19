@@ -89,13 +89,53 @@ func brush(b scene.Brush) error {
 	}
 	return nil
 }
+
+// budget accumulates every expanded node so a scene cannot multiply shapes
+// without bound. Counts stop growing once a limit is crossed.
+type budget struct {
+	shapes    int
+	uses      int
+	depth     int
+	documents map[string]bool
+	segments  int64
+	serial    int
+}
+
+func (b *budget) id(prefix string) string {
+	b.serial++
+	return fmt.Sprintf("%s%d", prefix, b.serial)
+}
+
+// Compile admits a document that declares no component references.
 func Compile(d scene.Document) (scene.Compiled, error) {
-	c := scene.Compiled{Document: d}
+	return CompileWithStore(d, nil)
+}
+
+// CompileWithStore admits a document and resolves its frozen component closure
+// from store. Only documents keyed by their own content digest are accepted, so
+// rendering never depends on a source plate retaining its name or revision.
+func CompileWithStore(d scene.Document, store map[string]scene.Document) (scene.Compiled, error) {
+	b := &budget{documents: map[string]bool{}}
+	layers, err := compileDocument(d, store, b, 1)
+	if err != nil {
+		return scene.Compiled{}, err
+	}
+	// Four samples per pixel; every fill is bounded even under adversarial input.
+	if b.segments*int64(d.Width)*int64(d.Height)*4 > 160_000_000 {
+		return scene.Compiled{}, fmt.Errorf("scene exceeds bounded rendering work")
+	}
+	return scene.Compiled{Document: d, Layers: layers, Segments: int(b.segments)}, nil
+}
+
+func compileDocument(d scene.Document, store map[string]scene.Document, b *budget, depth int) ([]scene.CompiledLayer, error) {
+	if depth > scene.MaxComponentDepth {
+		return nil, fmt.Errorf("component nesting exceeds %d levels", scene.MaxComponentDepth)
+	}
 	if d.Width < 1 || d.Height < 1 || d.Width > 512 || d.Height > 512 || !Color(d.Background) {
-		return c, fmt.Errorf("invalid canvas (maximum 512 square)")
+		return nil, fmt.Errorf("invalid canvas (maximum 512 square)")
 	}
 	if len(d.Layers) < 1 || len(d.Layers) > 16 {
-		return c, fmt.Errorf("requires 1..16 layers")
+		return nil, fmt.Errorf("requires 1..16 layers")
 	}
 	ids := map[string]bool{}
 	add := func(id string) error {
@@ -105,26 +145,37 @@ func Compile(d scene.Document) (scene.Compiled, error) {
 		ids[id] = true
 		return nil
 	}
+	// Shape ids only need to be unique within their own document; ids inside a
+	// mounted child live in the child's local namespace.
+	var shapeIDs map[string]bool
+	addShape := func(id string) error {
+		if shapeIDs == nil {
+			shapeIDs = map[string]bool{}
+		}
+		if !ID(id) || shapeIDs[id] {
+			return fmt.Errorf("invalid or duplicate shape id %q", id)
+		}
+		shapeIDs[id] = true
+		return nil
+	}
 	count := func(p geom.Path) {
 		for _, r := range p {
-			c.Segments += len(r)
+			b.segments += int64(len(r))
 		}
 	}
+	layers := make([]scene.CompiledLayer, 0, len(d.Layers))
 	for _, l := range d.Layers {
 		if err := add(l.ID); err != nil {
-			return c, err
+			return nil, err
 		}
 		if !Unit(l.Opacity) || (l.Blend != "normal" && l.Blend != "multiply" && l.Blend != "screen") {
-			return c, fmt.Errorf("invalid layer compositing")
+			return nil, fmt.Errorf("invalid layer compositing")
 		}
-		if len(l.Shapes) < 1 || len(l.Shapes) > 32 {
-			return c, fmt.Errorf("requires 1..32 shapes per layer")
-		}
-		cl := scene.CompiledLayer{Layer: l}
+		cl := scene.CompiledLayer{Layer: l, ClipID: b.id("c"), MaskID: b.id("m")}
 		if len(l.Clip) > 0 {
 			p, e := path(l.Clip)
 			if e != nil {
-				return c, e
+				return nil, e
 			}
 			cl.Clip = p
 			count(p)
@@ -132,47 +183,110 @@ func Compile(d scene.Document) (scene.Compiled, error) {
 		if len(l.Mask) > 0 {
 			p, e := path(l.Mask)
 			if e != nil {
-				return c, e
+				return nil, e
 			}
 			cl.Mask = p
 			count(p)
 		}
-		for _, s := range l.Shapes {
-			if err := add(s.ID); err != nil {
-				return c, err
+		if l.Component != nil {
+			cc, err := compileComponent(l, store, b, depth)
+			if err != nil {
+				return nil, err
 			}
-			if s.FillRule != "nonzero" && s.FillRule != "evenodd" {
-				return c, fmt.Errorf("invalid fill rule")
+			cl.Component = cc
+		} else {
+			if len(l.Shapes) < 1 || len(l.Shapes) > 32 {
+				return nil, fmt.Errorf("requires 1..32 shapes per layer")
 			}
-			for _, v := range s.Transform {
-				if !finite(v) {
-					return c, fmt.Errorf("invalid transform")
+			for _, s := range l.Shapes {
+				if err := addShape(s.ID); err != nil {
+					return nil, err
 				}
-			}
-			inv, ok := s.Transform.Inverse()
-			if !ok {
-				return c, fmt.Errorf("singular transform")
-			}
-			for _, v := range inv {
-				if !finite(v) {
-					return c, fmt.Errorf("ill-conditioned transform")
+				if s.FillRule != "nonzero" && s.FillRule != "evenodd" {
+					return nil, fmt.Errorf("invalid fill rule")
 				}
+				for _, v := range s.Transform {
+					if !finite(v) {
+						return nil, fmt.Errorf("invalid transform")
+					}
+				}
+				inv, ok := s.Transform.Inverse()
+				if !ok {
+					return nil, fmt.Errorf("singular transform")
+				}
+				for _, v := range inv {
+					if !finite(v) {
+						return nil, fmt.Errorf("ill-conditioned transform")
+					}
+				}
+				p, e := path(s.Path)
+				if e != nil {
+					return nil, e
+				}
+				if e = brush(s.Brush); e != nil {
+					return nil, e
+				}
+				count(p)
+				b.shapes++
+				if b.shapes > scene.MaxExpandedShapes {
+					return nil, fmt.Errorf("expanded component graph exceeds %d shapes", scene.MaxExpandedShapes)
+				}
+				cl.Shapes = append(cl.Shapes, scene.CompiledShape{Shape: s, Path: p, Inverse: inv, GradientID: b.id("b")})
 			}
-			p, e := path(s.Path)
-			if e != nil {
-				return c, e
-			}
-			if e = brush(s.Brush); e != nil {
-				return c, e
-			}
-			count(p)
-			cl.Shapes = append(cl.Shapes, scene.CompiledShape{Shape: s, Path: p, Inverse: inv})
 		}
-		c.Layers = append(c.Layers, cl)
+		layers = append(layers, cl)
 	}
-	// Four samples per pixel; every fill is bounded even under adversarial input.
-	if int64(c.Segments)*int64(d.Width)*int64(d.Height)*4 > 160_000_000 {
-		return c, fmt.Errorf("scene exceeds bounded rendering work")
+	return layers, nil
+}
+
+// compileComponent admits one mounted instance of a frozen document. Its
+// transform stays in the parent coordinate space; child clips, masks, gradient
+// axes and shape transforms keep their local meaning under mirroring/scaling.
+func compileComponent(l scene.Layer, store map[string]scene.Document, b *budget, depth int) (*scene.CompiledComponent, error) {
+	ref := l.Component
+	if len(l.Shapes) != 0 {
+		return nil, fmt.Errorf("component layer must not declare shapes")
 	}
-	return c, nil
+	if ref.Digest == "" {
+		return nil, fmt.Errorf("component reference requires a frozen digest")
+	}
+	for _, v := range ref.Transform {
+		if !finite(v) {
+			return nil, fmt.Errorf("invalid component transform")
+		}
+	}
+	inv, ok := ref.Transform.Inverse()
+	if !ok {
+		return nil, fmt.Errorf("singular component transform")
+	}
+	for _, v := range inv {
+		if !finite(v) {
+			return nil, fmt.Errorf("ill-conditioned component transform")
+		}
+	}
+	if depth > scene.MaxComponentDepth {
+		return nil, fmt.Errorf("component nesting exceeds %d levels", scene.MaxComponentDepth)
+	}
+	child, ok := store[ref.Digest]
+	if !ok {
+		return nil, fmt.Errorf("missing frozen component %s", ref.Digest)
+	}
+	if scene.Hash(child) != ref.Digest {
+		return nil, fmt.Errorf("component digest mismatch for %s", ref.Digest)
+	}
+	b.uses++
+	if b.uses > scene.MaxComponentUses {
+		return nil, fmt.Errorf("component instance count exceeds %d", scene.MaxComponentUses)
+	}
+	if !b.documents[ref.Digest] {
+		b.documents[ref.Digest] = true
+		if len(b.documents) > scene.MaxClosureDocuments {
+			return nil, fmt.Errorf("component closure exceeds %d documents", scene.MaxClosureDocuments)
+		}
+	}
+	layers, err := compileDocument(child, store, b, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	return &scene.CompiledComponent{Transform: ref.Transform, Inverse: inv, Layers: layers}, nil
 }

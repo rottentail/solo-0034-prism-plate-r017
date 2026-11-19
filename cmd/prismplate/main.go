@@ -30,10 +30,12 @@ func run() error {
 		return err
 	}
 	defer repo.Close()
-	// A checksum proves identity, not semantic validity. Recompile recovered scenes.
-	for _, p := range repo.View().Plates {
+	// A checksum proves identity, not semantic validity. Recompile recovered scenes
+	// against the frozen component closure that travel with them.
+	view := repo.View()
+	for _, p := range view.Plates {
 		for _, r := range p.Revisions {
-			if _, err = validate.Compile(r.Document); err != nil {
+			if _, err = validate.CompileWithStore(r.Document, view.Components); err != nil {
 				return err
 			}
 		}

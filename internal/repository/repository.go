@@ -47,10 +47,11 @@ type Proof struct {
 	Note     string `json:"note"`
 }
 type State struct {
-	Schema    string              `json:"schema"`
-	Plates    map[string]Plate    `json:"plates"`
-	Artifacts map[string]Artifact `json:"artifacts"`
-	Proofs    map[string]Proof    `json:"proofs"`
+	Schema     string                    `json:"schema"`
+	Plates     map[string]Plate          `json:"plates"`
+	Artifacts  map[string]Artifact       `json:"artifacts"`
+	Proofs     map[string]Proof          `json:"proofs"`
+	Components map[string]scene.Document `json:"components"`
 }
 type Repo struct {
 	mu    sync.RWMutex
@@ -62,7 +63,7 @@ type Repo struct {
 func Hash(b []byte) string              { v := sha256.Sum256(b); return hex.EncodeToString(v[:]) }
 func SceneHash(d scene.Document) string { b, _ := json.Marshal(d); return Hash(b) }
 func Fresh() State {
-	return State{Schema: "prism-plate-v1", Plates: map[string]Plate{}, Artifacts: map[string]Artifact{}, Proofs: map[string]Proof{}}
+	return State{Schema: "prism-plate-v1", Plates: map[string]Plate{}, Artifacts: map[string]Artifact{}, Proofs: map[string]Proof{}, Components: map[string]scene.Document{}}
 }
 func Open(root string) (*Repo, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -82,6 +83,10 @@ func Open(root string) (*Repo, error) {
 			err = json.Unmarshal(b, &r.state)
 		}
 		if err == nil {
+			if r.state.Components == nil {
+				// Snapshots written before component support have no closure.
+				r.state.Components = map[string]scene.Document{}
+			}
 			err = Check(r.state)
 		}
 	}
@@ -97,6 +102,14 @@ func Check(s State) error {
 	if s.Schema != "prism-plate-v1" || s.Plates == nil || s.Artifacts == nil || s.Proofs == nil {
 		return fmt.Errorf("unsupported snapshot schema")
 	}
+	if s.Components == nil {
+		s.Components = map[string]scene.Document{}
+	}
+	for digest, d := range s.Components {
+		if scene.Hash(d) != digest {
+			return fmt.Errorf("invalid component digest")
+		}
+	}
 	for id, p := range s.Plates {
 		if p.ID != id || len(p.Revisions) == 0 || (p.State != "active" && p.State != "archived") {
 			return fmt.Errorf("invalid plate lineage")
@@ -104,6 +117,9 @@ func Check(s State) error {
 		for i, r := range p.Revisions {
 			if r.Number != i+1 || r.Digest != SceneHash(r.Document) {
 				return fmt.Errorf("invalid revision digest")
+			}
+			if err := checkClosure(r.Document, s.Components); err != nil {
+				return err
 			}
 		}
 	}
@@ -121,8 +137,37 @@ func Check(s State) error {
 	}
 	return nil
 }
-func clone(s State) State   { b, _ := json.Marshal(s); var d State; _ = json.Unmarshal(b, &d); return d }
+
+// checkClosure makes the frozen component set self-contained: every mounted
+// digest must exist, match its key and be reachable without cycles.
+func checkClosure(d scene.Document, store map[string]scene.Document) error {
+	if _, err := scene.Closure(d, store); err != nil {
+		return fmt.Errorf("invalid component closure: %w", err)
+	}
+	return nil
+}
+func clone(s State) State {
+	b, _ := json.Marshal(s)
+	var d State
+	_ = json.Unmarshal(b, &d)
+	if d.Components == nil {
+		d.Components = map[string]scene.Document{}
+	}
+	return d
+}
 func (r *Repo) View() State { r.mu.RLock(); defer r.mu.RUnlock(); return clone(r.state) }
+
+// Components returns only the frozen component documents. Render paths use this
+// instead of View so a snapshot clone never copies artifact bytes.
+func (r *Repo) Components() map[string]scene.Document {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]scene.Document, len(r.state.Components))
+	for k, v := range r.state.Components {
+		out[k] = v
+	}
+	return out
+}
 
 // Update keeps failed persistence invisible. Rename is the commit point; directory
 // sync is best-effort because failure after rename cannot be represented as rollback.
@@ -139,7 +184,7 @@ func (r *Repo) Update(fn func(*State) error) error {
 	if err := Check(next); err != nil {
 		return err
 	}
-	if len(next.Plates) > 128 || len(next.Artifacts) > 256 || len(next.Proofs) > 1024 {
+	if len(next.Plates) > 128 || len(next.Artifacts) > 256 || len(next.Proofs) > 1024 || len(next.Components) > 4096 {
 		return fmt.Errorf("snapshot object capacity reached")
 	}
 	b, err := json.Marshal(next)

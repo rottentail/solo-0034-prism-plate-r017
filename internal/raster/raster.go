@@ -32,13 +32,7 @@ func Render(ctx context.Context, c scene.Compiled) ([]byte, error) {
 						if len(l.Mask) > 0 && !l.Mask.Contains(p, "nonzero") {
 							continue
 						}
-						src := paint.Pixel{}
-						for _, s := range l.Shapes {
-							q := s.Inverse.Apply(p)
-							if s.Path.Contains(q, s.Shape.FillRule) {
-								src = paint.Over(src, paint.Sample(s.Shape.Brush, q), "normal")
-							}
-						}
+						src := paint.Content(p, l)
 						dst = paint.Over(dst, src.Scale(l.Layer.Opacity), l.Layer.Blend)
 					}
 					sum.R += dst.R / 4
